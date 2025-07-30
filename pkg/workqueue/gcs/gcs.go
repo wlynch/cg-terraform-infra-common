@@ -27,8 +27,118 @@ import (
 
 // ClientInterface is an interface that abstracts the GCS client.
 type ClientInterface interface {
-	Object(name string) *storage.ObjectHandle
-	Objects(ctx context.Context, q *storage.Query) *storage.ObjectIterator
+	Object(name string) ObjectHandleInterface
+	Objects(ctx context.Context, q *storage.Query) ObjectIteratorInterface
+}
+
+// ObjectHandleInterface abstracts storage.ObjectHandle operations
+type ObjectHandleInterface interface {
+	If(conds storage.Conditions) ObjectHandleInterface
+	NewWriter(ctx context.Context) WriterInterface
+	CopierFrom(src ObjectHandleInterface) CopierInterface
+	Delete(ctx context.Context) error
+	Attrs(ctx context.Context) (*storage.ObjectAttrs, error)
+	Update(ctx context.Context, uattrs storage.ObjectAttrsToUpdate) (*storage.ObjectAttrs, error)
+}
+
+// WriterInterface abstracts storage.Writer operations
+type WriterInterface interface {
+	Write(data []byte) (int, error)
+	Close() error
+	SetMetadata(metadata map[string]string)
+}
+
+// CopierInterface abstracts storage.Copier operations
+type CopierInterface interface {
+	Run(ctx context.Context) (*storage.ObjectAttrs, error)
+	SetMetadata(metadata map[string]string)
+}
+
+// ObjectIteratorInterface abstracts storage.ObjectIterator operations
+type ObjectIteratorInterface interface {
+	Next() (*storage.ObjectAttrs, error)
+}
+
+// Adapter types to make real GCS client work with our interfaces
+type gcsClientAdapter struct {
+	bucket *storage.BucketHandle
+}
+
+func NewGCSClientAdapter(bucket *storage.BucketHandle) ClientInterface {
+	return &gcsClientAdapter{bucket: bucket}
+}
+
+func (a *gcsClientAdapter) Object(name string) ObjectHandleInterface {
+	return &gcsObjectHandleAdapter{handle: a.bucket.Object(name)}
+}
+
+func (a *gcsClientAdapter) Objects(ctx context.Context, q *storage.Query) ObjectIteratorInterface {
+	return &gcsObjectIteratorAdapter{iterator: a.bucket.Objects(ctx, q)}
+}
+
+type gcsObjectHandleAdapter struct {
+	handle *storage.ObjectHandle
+}
+
+func (a *gcsObjectHandleAdapter) If(conds storage.Conditions) ObjectHandleInterface {
+	return &gcsObjectHandleAdapter{handle: a.handle.If(conds)}
+}
+
+func (a *gcsObjectHandleAdapter) NewWriter(ctx context.Context) WriterInterface {
+	return &gcsWriterAdapter{writer: a.handle.NewWriter(ctx)}
+}
+
+func (a *gcsObjectHandleAdapter) CopierFrom(src ObjectHandleInterface) CopierInterface {
+	srcAdapter := src.(*gcsObjectHandleAdapter)
+	return &gcsCopierAdapter{copier: a.handle.CopierFrom(srcAdapter.handle)}
+}
+
+func (a *gcsObjectHandleAdapter) Delete(ctx context.Context) error {
+	return a.handle.Delete(ctx)
+}
+
+func (a *gcsObjectHandleAdapter) Attrs(ctx context.Context) (*storage.ObjectAttrs, error) {
+	return a.handle.Attrs(ctx)
+}
+
+func (a *gcsObjectHandleAdapter) Update(ctx context.Context, uattrs storage.ObjectAttrsToUpdate) (*storage.ObjectAttrs, error) {
+	return a.handle.Update(ctx, uattrs)
+}
+
+type gcsWriterAdapter struct {
+	writer *storage.Writer
+}
+
+func (a *gcsWriterAdapter) Write(data []byte) (int, error) {
+	return a.writer.Write(data)
+}
+
+func (a *gcsWriterAdapter) Close() error {
+	return a.writer.Close()
+}
+
+func (a *gcsWriterAdapter) SetMetadata(metadata map[string]string) {
+	a.writer.Metadata = metadata
+}
+
+type gcsCopierAdapter struct {
+	copier *storage.Copier
+}
+
+func (a *gcsCopierAdapter) Run(ctx context.Context) (*storage.ObjectAttrs, error) {
+	return a.copier.Run(ctx)
+}
+
+func (a *gcsCopierAdapter) SetMetadata(metadata map[string]string) {
+	a.copier.Metadata = metadata
+}
+
+type gcsObjectIteratorAdapter struct {
+	iterator *storage.ObjectIterator
+}
+
+func (a *gcsObjectIteratorAdapter) Next() (*storage.ObjectAttrs, error) {
+	return a.iterator.Next()
 }
 
 // NewWorkQueue creates a new GCS-backed workqueue.
@@ -79,12 +189,13 @@ func (w *wq) Queue(ctx context.Context, key string, opts workqueue.Options) erro
 		DoesNotExist: true,
 	}).NewWriter(ctx)
 
-	writer.Metadata = map[string]string{
+	metadata := map[string]string{
 		// Zero-pad the priority to 8 digits to ensure lexicographic ordering,
 		// so that we don't have to parse it to order things.
 		priorityMetadataKey: fmt.Sprintf("%08d", opts.Priority),
 	}
-	writer.Metadata[notBeforeMetadataKey] = opts.NotBefore.UTC().Format(time.RFC3339)
+	metadata[notBeforeMetadataKey] = opts.NotBefore.UTC().Format(time.RFC3339)
+	writer.SetMetadata(metadata)
 
 	mAddedKeys.With(prometheus.Labels{
 		"service_name":  env.KnativeServiceName,
@@ -103,7 +214,7 @@ func (w *wq) Queue(ctx context.Context, key string, opts workqueue.Options) erro
 			"revision_name": env.KnativeRevisionName,
 		}).Add(1)
 
-		if err := updateMetadata(ctx, w.client, key, writer.Metadata); err != nil {
+		if err := updateMetadata(ctx, w.client, key, metadata); err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				clog.InfoContextf(ctx, "Key %q was deleted before we could fetch the duplicate, recursing.", key)
 				return w.Queue(ctx, key, opts)
@@ -360,23 +471,25 @@ func (o *inProgressKey) RequeueWithOptions(ctx context.Context, opts workqueue.O
 	}).CopierFrom(o.client.Object(o.attrs.Name))
 
 	// Preserve metadata
-	copier.Metadata = o.attrs.Metadata
-	if copier.Metadata == nil {
-		copier.Metadata = make(map[string]string)
+	metadata := make(map[string]string)
+	if o.attrs.Metadata != nil {
+		for k, v := range o.attrs.Metadata {
+			metadata[k] = v
+		}
 	}
 	// Clear the lease expiration when copying the object back to avoid
 	// confusion since the object is no longer in progress.
-	delete(copier.Metadata, expirationMetadataKey)
+	delete(metadata, expirationMetadataKey)
 	// Set the last attempted time as unix timestamp when requeuing
-	copier.Metadata[lastAttemptedKey] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
+	metadata[lastAttemptedKey] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
 
 	// Handle custom delay if specified
 	if opts.Delay > 0 {
 		notBefore := time.Now().UTC().Add(opts.Delay)
-		copier.Metadata[notBeforeMetadataKey] = notBefore.Format(time.RFC3339)
-	} else if p, ok := copier.Metadata[priorityMetadataKey]; ok && p != noPriority {
+		metadata[notBeforeMetadataKey] = notBefore.Format(time.RFC3339)
+	} else if p, ok := metadata[priorityMetadataKey]; ok && p != noPriority {
 		// If no custom delay and priority is set, use the standard backoff
-		attempts, err := strconv.Atoi(copier.Metadata[attemptsMetadataKey])
+		attempts, err := strconv.Atoi(metadata[attemptsMetadataKey])
 		if err != nil {
 			clog.WarnContextf(ctx, "Malformed attempts on %s: %v", key, err)
 			attempts = 1
@@ -385,19 +498,20 @@ func (o *inProgressKey) RequeueWithOptions(ctx context.Context, opts workqueue.O
 		if backoffDelay > workqueue.MaximumBackoffPeriod {
 			backoffDelay = workqueue.MaximumBackoffPeriod
 		}
-		copier.Metadata[notBeforeMetadataKey] = time.Now().UTC().Add(backoffDelay).Format(time.RFC3339)
+		metadata[notBeforeMetadataKey] = time.Now().UTC().Add(backoffDelay).Format(time.RFC3339)
 	}
 
 	// Update priority if specified
 	if opts.Priority != 0 {
-		copier.Metadata[priorityMetadataKey] = strconv.FormatInt(opts.Priority, 10)
+		metadata[priorityMetadataKey] = strconv.FormatInt(opts.Priority, 10)
 	}
+	copier.SetMetadata(metadata)
 
 	_, err := copier.Run(ctx)
 	if exists, err := checkPreconditionFailedOk(err); err != nil {
 		return fmt.Errorf("Run() = %w", err)
 	} else if exists {
-		if err := updateMetadata(ctx, o.client, key, copier.Metadata); err != nil {
+		if err := updateMetadata(ctx, o.client, key, metadata); err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				clog.InfoContextf(ctx, "Key %q was deleted before we could fetch the duplicate, recursing.", key)
 				return o.RequeueWithOptions(ctx, opts)
@@ -473,16 +587,19 @@ func (o *inProgressKey) Deadletter(ctx context.Context) error {
 	copier := o.client.Object(deadLetterKey).CopierFrom(o.client.Object(o.attrs.Name))
 
 	// Preserve metadata
-	copier.Metadata = o.attrs.Metadata
-	if copier.Metadata == nil {
-		copier.Metadata = make(map[string]string)
+	metadata := make(map[string]string)
+	if o.attrs.Metadata != nil {
+		for k, v := range o.attrs.Metadata {
+			metadata[k] = v
+		}
 	}
 
 	// Clear the lease expiration when copying the object
-	delete(copier.Metadata, expirationMetadataKey)
+	delete(metadata, expirationMetadataKey)
 
 	// Add metadata about when the key was dead-lettered
-	copier.Metadata[failedTimeMetadataKey] = time.Now().UTC().Format(time.RFC3339)
+	metadata[failedTimeMetadataKey] = time.Now().UTC().Format(time.RFC3339)
+	copier.SetMetadata(metadata)
 
 	// Create the dead letter entry
 	_, err := copier.Run(ctx)
@@ -590,27 +707,30 @@ func (q *queuedKey) Start(ctx context.Context) (workqueue.OwnedInProgressKey, er
 	}).CopierFrom(q.client.Object(srcObject))
 
 	// Preserve metadata
-	copier.Metadata = q.attrs.Metadata
-	if copier.Metadata == nil {
-		copier.Metadata = make(map[string]string, 2)
+	metadata := make(map[string]string, 2)
+	if q.attrs.Metadata != nil {
+		for k, v := range q.attrs.Metadata {
+			metadata[k] = v
+		}
 	}
 	// Set the expiration metadata to 3x the refresh interval.
-	copier.Metadata[expirationMetadataKey] = time.Now().UTC().Add(3 * RefreshInterval).Format(time.RFC3339)
-	if att, ok := copier.Metadata[attemptsMetadataKey]; ok {
+	metadata[expirationMetadataKey] = time.Now().UTC().Add(3 * RefreshInterval).Format(time.RFC3339)
+	if att, ok := metadata[attemptsMetadataKey]; ok {
 		prevAttempts, err := strconv.Atoi(att)
 		if err != nil {
 			clog.ErrorContextf(ctx, "Malformed attempts on %s: %v", srcObject, err)
-			copier.Metadata[attemptsMetadataKey] = "1"
+			metadata[attemptsMetadataKey] = "1"
 		} else {
-			copier.Metadata[attemptsMetadataKey] = fmt.Sprint(prevAttempts + 1)
+			metadata[attemptsMetadataKey] = fmt.Sprint(prevAttempts + 1)
 		}
 	} else {
-		copier.Metadata[attemptsMetadataKey] = "1"
+		metadata[attemptsMetadataKey] = "1"
 	}
 	// Never persist the not-before metadata to a running task.
 	// We set it to the zero value instead of deleting it so that we can assume
 	// the invariant that this key is always present and date-formatted.
-	copier.Metadata[notBeforeMetadataKey] = noNotBefore
+	metadata[notBeforeMetadataKey] = noNotBefore
+	copier.SetMetadata(metadata)
 
 	attrs, err := copier.Run(ctx)
 	if err != nil {
