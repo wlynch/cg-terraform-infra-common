@@ -87,8 +87,9 @@ func (w *wq) Queue(ctx context.Context, key string, opts workqueue.Options) erro
 	writer.Metadata[notBeforeMetadataKey] = opts.NotBefore.UTC().Format(time.RFC3339)
 
 	mAddedKeys.With(prometheus.Labels{
-		"service_name":  env.KnativeServiceName,
-		"revision_name": env.KnativeRevisionName,
+		"service_name":   env.KnativeServiceName,
+		"revision_name":  env.KnativeRevisionName,
+		"priority_class": priorityClass(opts.Priority),
 	}).Add(1)
 
 	if _, err := writer.Write([]byte("")); err != nil {
@@ -99,8 +100,9 @@ func (w *wq) Queue(ctx context.Context, key string, opts workqueue.Options) erro
 	} else if exists {
 		clog.DebugContextf(ctx, "Key %q already exists", key)
 		mDedupedKeys.With(prometheus.Labels{
-			"service_name":  env.KnativeServiceName,
-			"revision_name": env.KnativeRevisionName,
+			"service_name":   env.KnativeServiceName,
+			"revision_name":  env.KnativeRevisionName,
+			"priority_class": priorityClass(opts.Priority),
 		}).Add(1)
 
 		if err := updateMetadata(ctx, w.client, key, writer.Metadata); err != nil {
@@ -186,6 +188,16 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 
 	queued, notbefore, deadlettered := 0, 0, 0
 	maxAttempts := 0 // Track the maximum number of attempts
+
+	// Track counts by priority class
+	type priorityStats struct {
+		wip          int
+		queued       int
+		notbefore    int
+		deadlettered int
+		maxAttempts  int
+	}
+	statsByPriority := make(map[string]*priorityStats)
 	for {
 		objAttrs, err := iter.Next()
 		if errors.Is(err, iterator.Done) {
@@ -200,6 +212,7 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 				clog.WarnContextf(ctx, "Failed to parse priority: %v", err)
 			}
 		}
+		priorityClass := priorityClass(priority)
 		// Only check for max attempts if this is not a deadlettered item
 		if !strings.HasPrefix(objAttrs.Name, deadLetterPrefix) {
 			// Check for attempts and track maximum
@@ -210,12 +223,16 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 				} else if attempts > maxAttempts {
 					maxAttempts = attempts
 				}
+				if attempts > maxAttemptsByPriority[priorityClass] {
+					maxAttemptsByPriority[priorityClass] = attempts
+				}
 				if attempts > TrackWorkAttemptMinThreshold {
 					mTaskMaxAttempts.With(
 						prometheus.Labels{
-							"service_name":  env.KnativeServiceName,
-							"revision_name": env.KnativeRevisionName,
-							"task_id":       objAttrs.Name,
+							"service_name":   env.KnativeServiceName,
+							"revision_name":  env.KnativeRevisionName,
+							"priority_class": priorityClass,
+							"task_id":        objAttrs.Name,
 						},
 					).Set(float64(attempts))
 				}
@@ -224,9 +241,10 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 		// Ensure metric has a value.
 		mTaskMaxAttempts.With(
 			prometheus.Labels{
-				"service_name":  env.KnativeServiceName,
-				"revision_name": env.KnativeRevisionName,
-				"task_id":       "placeholder",
+				"service_name":   env.KnativeServiceName,
+				"revision_name":  env.KnativeRevisionName,
+				"priority_class": priorityClass,
+				"task_id":        "placeholder",
 			},
 		).Set(float64(0))
 
@@ -237,6 +255,7 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 				attrs:    objAttrs,
 				priority: priority,
 			})
+			wipByPriority[priorityClass]++
 
 		case strings.HasPrefix(objAttrs.Name, queuedPrefix):
 			if nbf, ok := objAttrs.Metadata[notBeforeMetadataKey]; ok && nbf != "" {
@@ -245,6 +264,7 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 				} else if time.Now().UTC().Before(notBefore) {
 					clog.InfoContextf(ctx, "Skipping key %q until %v", objAttrs.Name, notBefore)
 					notbefore++
+					notbeforeByPriority[priorityClass]++
 					continue
 				}
 			}
@@ -268,10 +288,12 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 				qd = qd[:w.limit]
 			}
 			queued++
+			queuedByPriority[priorityClass]++
 
 		case strings.HasPrefix(objAttrs.Name, deadLetterPrefix):
 			// Count the dead-lettered keys
 			deadlettered++
+			deadletteredByPriority[priorityClass]++
 		}
 	}
 
@@ -280,17 +302,41 @@ func (w *wq) Enumerate(ctx context.Context) ([]workqueue.ObservedInProgressKey, 
 		qk = append(qk, qi)
 	}
 
-	// Set all metrics
-	labels := prometheus.Labels{
-		"service_name":  env.KnativeServiceName,
-		"revision_name": env.KnativeRevisionName,
+	// Set metrics by priority class
+	allPriorityClasses := make(map[string]bool)
+	for pc := range wipByPriority {
+		allPriorityClasses[pc] = true
 	}
-	mInProgressKeys.With(labels).Set(float64(len(wip)))
-	mQueuedKeys.With(labels).Set(float64(queued))
-	mNotBeforeKeys.With(labels).Set(float64(notbefore))
-	mDeadLetteredKeys.With(labels).Set(float64(deadlettered))
-	// Set the max attempts metric
-	mMaxAttempts.With(labels).Set(float64(maxAttempts))
+	for pc := range queuedByPriority {
+		allPriorityClasses[pc] = true
+	}
+	for pc := range notbeforeByPriority {
+		allPriorityClasses[pc] = true
+	}
+	for pc := range deadletteredByPriority {
+		allPriorityClasses[pc] = true
+	}
+	for pc := range maxAttemptsByPriority {
+		allPriorityClasses[pc] = true
+	}
+
+	// Ensure we have at least the default priority class if no tasks exist
+	if len(allPriorityClasses) == 0 {
+		allPriorityClasses["0xx"] = true
+	}
+
+	for priorityClass := range allPriorityClasses {
+		labels := prometheus.Labels{
+			"service_name":   env.KnativeServiceName,
+			"revision_name":  env.KnativeRevisionName,
+			"priority_class": priorityClass,
+		}
+		mInProgressKeys.With(labels).Set(float64(wipByPriority[priorityClass]))
+		mQueuedKeys.With(labels).Set(float64(queuedByPriority[priorityClass]))
+		mNotBeforeKeys.With(labels).Set(float64(notbeforeByPriority[priorityClass]))
+		mDeadLetteredKeys.With(labels).Set(float64(deadletteredByPriority[priorityClass]))
+		mMaxAttempts.With(labels).Set(float64(maxAttemptsByPriority[priorityClass]))
+	}
 	return wip, qk, nil
 }
 
@@ -449,8 +495,9 @@ func (o *inProgressKey) Complete(ctx context.Context) error {
 	// Record the number of attempts for this successful completion
 	attempts := o.GetAttempts()
 	mCompletionAttempts.With(prometheus.Labels{
-		"service_name":  env.KnativeServiceName,
-		"revision_name": env.KnativeRevisionName,
+		"service_name":   env.KnativeServiceName,
+		"revision_name":  env.KnativeRevisionName,
+		"priority_class": priorityClass(o.priority),
 	}).Observe(float64(attempts))
 
 	// Record time to completion

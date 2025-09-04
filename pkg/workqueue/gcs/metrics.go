@@ -29,35 +29,35 @@ var (
 			Name: "workqueue_in_progress_keys",
 			Help: "The number of keys currently being processed by this workqueue.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mQueuedKeys = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "workqueue_queued_keys",
 			Help: "The number of keys currently in the backlog of this workqueue.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mNotBeforeKeys = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "workqueue_notbefore_keys",
 			Help: "The number of keys waiting on a 'not before' in the backlog of this workqueue.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mMaxAttempts = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "workqueue_max_attempts",
 			Help: "The maximum number of attempts for any queued or in-progress task.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mTaskMaxAttempts = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "workqueue_task_max_attempts",
 			Help: "The maximum number of attempts for a given task above 20.",
 		},
-		[]string{"service_name", "revision_name", "task_id"},
+		[]string{"service_name", "revision_name", "priority_class", "task_id"},
 	)
 	mWorkLatency = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -80,14 +80,14 @@ var (
 			Name: "workqueue_added_keys",
 			Help: "The total number of queue requests.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mDedupedKeys = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "workqueue_deduped_keys",
 			Help: "The total number of keys that were deduped.",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mCompletionAttempts = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -95,14 +95,14 @@ var (
 			Help:    "The number of attempts for successfully completed tasks",
 			Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024},
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mDeadLetteredKeys = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "workqueue_dead_lettered_keys",
 			Help: "The number of keys currently in the dead letter queue",
 		},
-		[]string{"service_name", "revision_name"},
+		[]string{"service_name", "revision_name", "priority_class"},
 	)
 	mTimeToCompletion = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
